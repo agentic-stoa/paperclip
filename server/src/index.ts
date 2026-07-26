@@ -38,6 +38,7 @@ import {
   feedbackService,
   backfillPrincipalAccessCompatibility,
   bootstrapExecutionPolicyFromEnv,
+  executionWorkspaceService,
   heartbeatService,
   instanceSettingsService,
   reconcileCloudUpstreamRunsOnStartup,
@@ -841,6 +842,17 @@ export async function startServer(): Promise<StartedServer> {
         })
         .catch((err) => {
           logger.error({ err }, "routine scheduler tick failed");
+        });
+
+      void executionWorkspaceService(db as any)
+        .sweepTerminalIssueWorktrees(new Date())
+        .then((result) => {
+          if (result.archived > 0 || result.cleanupFailed > 0 || result.blocked > 0) {
+            logger.info({ ...result }, "terminal issue worktree sweep processed execution workspaces");
+          }
+        })
+        .catch((err) => {
+          logger.error({ err }, "terminal issue worktree sweep failed");
         });
   
       // Periodically reap orphaned runs (5-min staleness threshold) and make sure

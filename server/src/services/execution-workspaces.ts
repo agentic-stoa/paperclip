@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
-import { and, desc, eq, inArray, isNull } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, lte } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { executionWorkspaces, issues, projects, projectWorkspaces, workspaceRuntimeServices } from "@paperclipai/db";
 import type {
@@ -20,11 +20,17 @@ import {
   listCurrentRuntimeServicesForExecutionWorkspaces,
   listCurrentRuntimeServicesForProjectWorkspaces,
 } from "./workspace-runtime-read-model.js";
+import {
+  cleanupExecutionWorkspaceArtifacts,
+  stopRuntimeServicesForExecutionWorkspace,
+} from "./workspace-runtime.js";
 
 type ExecutionWorkspaceRow = typeof executionWorkspaces.$inferSelect;
 type WorkspaceRuntimeServiceRow = typeof workspaceRuntimeServices.$inferSelect;
 const execFileAsync = promisify(execFile);
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
+const AUTO_PRUNE_ELIGIBLE_STATUSES = ["active", "idle", "in_review"] as const;
+const AUTO_PRUNE_RETRY_MS = 24 * 60 * 60 * 1000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -395,6 +401,123 @@ async function loadEffectiveRuntimeServicesByExecutionWorkspace(
 }
 
 export function executionWorkspaceService(db: Db) {
+  async function archiveWorkspaceById(id: string) {
+    const existing = await db
+      .select()
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, id))
+      .then((rows) => rows[0] ?? null);
+    if (!existing) {
+      return { outcome: "not_found" as const, workspace: null, cleanupWarnings: [] as string[] };
+    }
+
+    const readiness = await service.getCloseReadiness(id);
+    if (!readiness) {
+      return { outcome: "not_found" as const, workspace: null, cleanupWarnings: [] as string[] };
+    }
+    if (readiness.state === "blocked") {
+      return {
+        outcome: "blocked" as const,
+        workspace: toExecutionWorkspace(existing),
+        cleanupWarnings: [] as string[],
+        readiness,
+      };
+    }
+
+    const configForCleanup = readExecutionWorkspaceConfig((existing.metadata as Record<string, unknown> | null) ?? null);
+    const closedAt = new Date();
+    let workspace = await service.update(id, {
+      status: "archived",
+      closedAt,
+      cleanupEligibleAt: null,
+      cleanupReason: null,
+    });
+    if (!workspace) {
+      return { outcome: "not_found" as const, workspace: null, cleanupWarnings: [] as string[] };
+    }
+
+    if (existing.mode === "shared_workspace") {
+      await db
+        .update(issues)
+        .set({
+          executionWorkspaceId: null,
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(issues.companyId, existing.companyId),
+            eq(issues.executionWorkspaceId, existing.id),
+          ),
+        );
+    }
+
+    try {
+      await stopRuntimeServicesForExecutionWorkspace({
+        db,
+        executionWorkspaceId: existing.id,
+        workspaceCwd: existing.cwd,
+      });
+      const projectWorkspace = existing.projectWorkspaceId
+        ? await db
+            .select({
+              cwd: projectWorkspaces.cwd,
+              cleanupCommand: projectWorkspaces.cleanupCommand,
+            })
+            .from(projectWorkspaces)
+            .where(
+              and(
+                eq(projectWorkspaces.id, existing.projectWorkspaceId),
+                eq(projectWorkspaces.companyId, existing.companyId),
+              ),
+            )
+            .then((rows) => rows[0] ?? null)
+        : null;
+      const projectPolicy = existing.projectId
+        ? await db
+            .select({
+              executionWorkspacePolicy: projects.executionWorkspacePolicy,
+            })
+            .from(projects)
+            .where(and(eq(projects.id, existing.projectId), eq(projects.companyId, existing.companyId)))
+            .then((rows) => parseProjectExecutionWorkspacePolicy(rows[0]?.executionWorkspacePolicy))
+        : null;
+      const cleanupResult = await cleanupExecutionWorkspaceArtifacts({
+        workspace: existing,
+        projectWorkspace,
+        teardownCommand: configForCleanup?.teardownCommand ?? projectPolicy?.workspaceStrategy?.teardownCommand ?? null,
+        cleanupCommand: configForCleanup?.cleanupCommand ?? null,
+      });
+      const cleanupWarnings = cleanupResult.warnings;
+      if (cleanupWarnings.length > 0 || !cleanupResult.cleaned) {
+        workspace = (await service.update(id, {
+          closedAt,
+          cleanupEligibleAt: null,
+          cleanupReason: cleanupWarnings.length > 0 ? cleanupWarnings.join(" | ") : null,
+          ...(!cleanupResult.cleaned ? { status: "cleanup_failed" } : {}),
+        })) ?? workspace;
+      }
+      return {
+        outcome: cleanupResult.cleaned ? "archived" as const : "cleanup_failed" as const,
+        workspace,
+        cleanupWarnings,
+      };
+    } catch (error) {
+      const failureReason = error instanceof Error ? error.message : String(error);
+      workspace = (await service.update(id, {
+        status: "cleanup_failed",
+        closedAt,
+        cleanupEligibleAt: null,
+        cleanupReason: failureReason,
+      })) ?? workspace;
+      return {
+        outcome: "cleanup_failed" as const,
+        workspace,
+        cleanupWarnings: [] as string[],
+        error: failureReason,
+      };
+    }
+  }
+
   function buildListConditions(
     companyId: string,
     filters?: {
@@ -424,7 +547,7 @@ export function executionWorkspaceService(db: Db) {
     return conditions;
   }
 
-  return {
+  const service = {
     list: async (companyId: string, filters?: {
       projectId?: string;
       projectWorkspaceId?: string;
@@ -786,7 +909,61 @@ export function executionWorkspaceService(db: Db) {
         return cleared;
       });
     },
+
+    archiveById: archiveWorkspaceById,
+
+    sweepTerminalIssueWorktrees: async (now: Date = new Date(), limit = 25) => {
+      const dueRows = await db
+        .select({
+          id: executionWorkspaces.id,
+        })
+        .from(executionWorkspaces)
+        .innerJoin(issues, eq(issues.id, executionWorkspaces.sourceIssueId))
+        .where(
+          and(
+            isNull(executionWorkspaces.closedAt),
+            inArray(executionWorkspaces.status, [...AUTO_PRUNE_ELIGIBLE_STATUSES]),
+            eq(executionWorkspaces.providerType, "git_worktree"),
+            lte(executionWorkspaces.cleanupEligibleAt, now),
+            inArray(issues.status, [...TERMINAL_ISSUE_STATUSES]),
+          ),
+        )
+        .orderBy(executionWorkspaces.cleanupEligibleAt, executionWorkspaces.lastUsedAt)
+        .limit(limit);
+
+      const result = {
+        scanned: dueRows.length,
+        archived: 0,
+        cleanupFailed: 0,
+        blocked: 0,
+        skipped: 0,
+      };
+
+      for (const row of dueRows) {
+        const archived = await archiveWorkspaceById(row.id);
+        if (archived.outcome === "archived") {
+          result.archived += 1;
+          continue;
+        }
+        if (archived.outcome === "cleanup_failed") {
+          result.cleanupFailed += 1;
+          continue;
+        }
+        if (archived.outcome === "blocked") {
+          result.blocked += 1;
+          await service.update(row.id, {
+            cleanupEligibleAt: new Date(now.getTime() + AUTO_PRUNE_RETRY_MS),
+            cleanupReason: archived.readiness.blockingReasons[0] ?? "Workspace close is currently blocked.",
+          });
+          continue;
+        }
+        result.skipped += 1;
+      }
+
+      return result;
+    },
   };
+  return service;
 }
 
 export { toExecutionWorkspace };

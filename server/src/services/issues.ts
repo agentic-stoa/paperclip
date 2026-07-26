@@ -99,6 +99,7 @@ const ISSUE_COMMENT_RUN_LOG_DERIVATION_MAX_LOG_BYTES = 2_000_000;
 const ISSUE_COMMENT_RUN_LOG_DERIVATION_CHUNK_BYTES = 256_000;
 const ISSUE_COMMENT_RUN_LOG_DERIVATION_END_SLACK_MS = 60_000;
 const ISSUE_COMMENT_RUN_LOG_DERIVATION_MAX_PARALLEL_READS = 8;
+const TERMINAL_WORKSPACE_CLEANUP_DELAY_MS = 24 * 60 * 60 * 1000;
 const DELETED_ISSUE_COMMENT_BODY = "";
 function assertTransition(from: string, to: string) {
   if (from === to) return;
@@ -147,6 +148,48 @@ function toTimestampMs(value: Date | string | null | undefined) {
   const date = value instanceof Date ? value : new Date(value);
   const timestamp = date.getTime();
   return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function terminalWorkspaceCleanupEligibleAt(input: {
+  status: string | null | undefined;
+  completedAt?: Date | string | null;
+  cancelledAt?: Date | string | null;
+}) {
+  const base =
+    input.status === "done"
+      ? (input.completedAt instanceof Date ? input.completedAt : input.completedAt ? new Date(input.completedAt) : new Date())
+      : input.status === "cancelled"
+        ? (input.cancelledAt instanceof Date ? input.cancelledAt : input.cancelledAt ? new Date(input.cancelledAt) : new Date())
+        : null;
+  return base ? new Date(base.getTime() + TERMINAL_WORKSPACE_CLEANUP_DELAY_MS) : null;
+}
+
+async function syncSourceIssueWorkspaceCleanupEligibility(
+  dbOrTx: Db | any,
+  input: {
+    companyId: string;
+    issueId: string;
+    status: string | null | undefined;
+    completedAt?: Date | string | null;
+    cancelledAt?: Date | string | null;
+  },
+) {
+  const cleanupEligibleAt = terminalWorkspaceCleanupEligibleAt(input);
+  await dbOrTx
+    .update(executionWorkspaces)
+    .set({
+      cleanupEligibleAt,
+      cleanupReason: null,
+      updatedAt: new Date(),
+    })
+    .where(
+      and(
+        eq(executionWorkspaces.companyId, input.companyId),
+        eq(executionWorkspaces.sourceIssueId, input.issueId),
+        eq(executionWorkspaces.providerType, "git_worktree"),
+        isNull(executionWorkspaces.closedAt),
+      ),
+    );
 }
 
 type IssueCommentRunLogAttributionCandidate = {
@@ -5089,6 +5132,13 @@ export function issueService(db: Db) {
           );
         }
         const [enriched] = await withIssueLabels(tx, [issue]);
+        await syncSourceIssueWorkspaceCleanupEligibility(tx, {
+          companyId,
+          issueId: issue.id,
+          status: issue.status,
+          completedAt: issue.completedAt,
+          cancelledAt: issue.cancelledAt,
+        });
         return enriched;
       });
     },
@@ -5407,6 +5457,13 @@ export function issueService(db: Db) {
               );
           }
         }
+        await syncSourceIssueWorkspaceCleanupEligibility(tx, {
+          companyId: existing.companyId,
+          issueId: updated.id,
+          status: updated.status,
+          completedAt: updated.completedAt,
+          cancelledAt: updated.cancelledAt,
+        });
         return enriched;
       };
 

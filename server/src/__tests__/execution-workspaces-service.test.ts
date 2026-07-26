@@ -5,7 +5,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { inArray } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import {
   companies,
   createDb,
@@ -520,5 +520,95 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       "git_worktree_remove",
       "git_branch_delete",
     ]));
+  }, 20_000);
+
+  it("archives due terminal-issue git worktrees during the automated sweep", async () => {
+    const repoRoot = await createTempRepo();
+    tempDirs.add(repoRoot);
+    const worktreePath = path.join(path.dirname(repoRoot), `paperclip-sweep-${randomUUID()}`);
+    tempDirs.add(worktreePath);
+
+    await runGit(repoRoot, ["branch", "paperclip-sweep-branch"]);
+    await runGit(repoRoot, ["worktree", "add", worktreePath, "paperclip-sweep-branch"]);
+
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+    const sourceIssueId = randomUUID();
+    const now = new Date("2026-07-26T12:00:00.000Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "PAP",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Workspaces",
+      status: "in_progress",
+      executionWorkspacePolicy: {
+        enabled: true,
+      },
+    });
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary",
+      sourceType: "git_repo",
+      isPrimary: true,
+      cwd: repoRoot,
+    });
+    await db.insert(issues).values({
+      id: sourceIssueId,
+      companyId,
+      projectId,
+      title: "Finished issue",
+      status: "done",
+      priority: "medium",
+      completedAt: new Date("2026-07-25T11:00:00.000Z"),
+    });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      sourceIssueId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "Sweep candidate",
+      status: "idle",
+      providerType: "git_worktree",
+      cwd: worktreePath,
+      providerRef: worktreePath,
+      branchName: "paperclip-sweep-branch",
+      baseRef: "main",
+      cleanupEligibleAt: new Date("2026-07-25T12:00:00.000Z"),
+      metadata: {
+        createdByRuntime: true,
+      },
+    });
+    await db.update(issues).set({ executionWorkspaceId }).where(eq(issues.id, sourceIssueId));
+
+    const result = await svc.sweepTerminalIssueWorktrees(now);
+
+    expect(result).toEqual({
+      scanned: 1,
+      archived: 1,
+      cleanupFailed: 0,
+      blocked: 0,
+      skipped: 0,
+    });
+
+    const archived = await svc.getById(executionWorkspaceId);
+    expect(archived).toMatchObject({
+      id: executionWorkspaceId,
+      status: "archived",
+      cleanupEligibleAt: null,
+    });
+    await expect(fs.stat(worktreePath)).rejects.toThrow();
   }, 20_000);
 });
